@@ -1,12 +1,17 @@
 import datetime as dt
+import hashlib
+import json
+import os
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple
 
 import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_js_eval import get_geolocation
+from streamlit_js_eval import get_geolocation, streamlit_js_eval
 
 
 # =========================
@@ -26,7 +31,9 @@ from streamlit_js_eval import get_geolocation
 # - ここでは「花粉系の目安」として、取得できる花粉データを合算して使います。
 
 
-APP_VERSION = "v0.3 web-gps"
+APP_VERSION = "v0.4 web-gps-analytics"
+LOG_FILE = Path("usage_log.csv")
+VISITOR_SALT = "ventilation-forecast-app-v1"
 
 # 西尾市などの固定プリセットは廃止。
 # スマホ・PCブラウザの位置情報、または手入力した緯度経度を使って予報します。
@@ -119,6 +126,219 @@ def _parse_manual_coords(lat_text: str, lon_text: str) -> Tuple[float | None, fl
         return None, None, "経度は -180〜180 の範囲で入力してください。"
 
     return lat, lon, None
+
+
+def _now_jst() -> dt.datetime:
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
+
+
+def _hash_visitor_id(visitor_id: str | None) -> str:
+    raw = visitor_id or "unknown"
+    return hashlib.sha256(f"{VISITOR_SALT}:{raw}".encode("utf-8")).hexdigest()[:16]
+
+
+def _round_coord(value: float | None, digits: int = 2) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def _get_admin_pin() -> str:
+    """Streamlit Secretsまたは環境変数から管理画面PINを取得。未設定時は初期値1234。"""
+    try:
+        pin = st.secrets.get("ADMIN_PIN", None)
+        if pin is not None:
+            return str(pin)
+    except Exception:
+        pass
+    return os.environ.get("ADMIN_PIN", "1234")
+
+
+def get_browser_visitor_id() -> str | None:
+    """ブラウザのlocalStorageに匿名IDを作成・保存して、ユニーク数の推定に使う。"""
+    js = """
+    (() => {
+      const key = 'vfa_visitor_id_v1';
+      let id = localStorage.getItem(key);
+      if (!id) {
+        if (window.crypto && crypto.randomUUID) {
+          id = crypto.randomUUID();
+        } else {
+          id = String(Date.now()) + '-' + String(Math.random()).slice(2);
+        }
+        localStorage.setItem(key, id);
+      }
+      return id;
+    })()
+    """
+    try:
+        return streamlit_js_eval(js_expressions=js, key="visitor_id_v1")
+    except Exception:
+        return None
+
+
+def get_browser_info() -> Tuple[str, int | None]:
+    """端末種別の推定に使う情報をブラウザから取得。"""
+    try:
+        width = streamlit_js_eval(js_expressions="window.innerWidth", key="screen_width_v1")
+    except Exception:
+        width = None
+
+    try:
+        ua = streamlit_js_eval(js_expressions="navigator.userAgent", key="user_agent_v1")
+    except Exception:
+        ua = ""
+
+    width_int = None
+    try:
+        if width is not None:
+            width_int = int(width)
+    except Exception:
+        width_int = None
+
+    ua_text = str(ua or "").lower()
+    if width_int is not None and width_int <= 768:
+        device_type = "smartphone"
+    elif any(x in ua_text for x in ["iphone", "android", "mobile"]):
+        device_type = "smartphone"
+    elif any(x in ua_text for x in ["ipad", "tablet"]):
+        device_type = "tablet"
+    elif width_int is not None:
+        device_type = "desktop"
+    else:
+        device_type = "unknown"
+
+    return device_type, width_int
+
+
+def log_usage_event(
+    event_name: str,
+    visitor_id: str | None,
+    session_id: str,
+    device_type: str,
+    screen_width: int | None,
+    geo_success: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    location_source: str | None = None,
+    forecast_days: int | None = None,
+) -> None:
+    """利用ログをCSVに追記する。個人情報対策としてIDはハッシュ化し、緯度経度は小数第2位に丸める。"""
+    now = _now_jst()
+    row = {
+        "timestamp_jst": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "date_jst": now.strftime("%Y-%m-%d"),
+        "event_name": event_name,
+        "visitor_hash": _hash_visitor_id(visitor_id),
+        "session_id": session_id,
+        "device_type": device_type,
+        "screen_width": screen_width,
+        "geo_success": geo_success,
+        "location_source": location_source,
+        "lat_rounded": _round_coord(latitude),
+        "lon_rounded": _round_coord(longitude),
+        "forecast_days": forecast_days,
+        "app_version": APP_VERSION,
+    }
+
+    df_row = pd.DataFrame([row])
+    try:
+        file_exists = LOG_FILE.exists()
+        df_row.to_csv(LOG_FILE, mode="a", header=not file_exists, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        # ログ保存失敗でアプリ本体を止めない。
+        st.session_state["log_error"] = str(e)
+
+
+@st.cache_data(ttl=10)
+def load_usage_log() -> pd.DataFrame:
+    if not LOG_FILE.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(LOG_FILE)
+    except Exception:
+        return pd.DataFrame()
+
+
+def show_admin_analytics() -> None:
+    """アプリ内の簡易アクセス解析画面。"""
+    st.subheader("管理者用：利用状況")
+    st.caption("この集計はアプリ内CSVログをもとにしています。Streamlit Cloudの再起動・再デプロイで消える可能性があります。")
+
+    df = load_usage_log()
+    if df.empty:
+        st.info("まだ利用ログがありません。")
+        return
+
+    page_df = df[df["event_name"] == "page_view"].copy()
+    forecast_df = df[df["event_name"] == "forecast_view"].copy()
+
+    total_access = len(page_df)
+    total_unique = page_df["visitor_hash"].nunique() if not page_df.empty else 0
+    forecast_views = len(forecast_df)
+    forecast_unique = forecast_df["visitor_hash"].nunique() if not forecast_df.empty else 0
+
+    today = _now_jst().strftime("%Y-%m-%d")
+    today_page = page_df[page_df["date_jst"] == today]
+    today_unique = today_page["visitor_hash"].nunique() if not today_page.empty else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("累計アクセス", f"{total_access}")
+    c2.metric("累計ユニーク", f"{total_unique}")
+    c3.metric("今日のアクセス", f"{len(today_page)}")
+    c4.metric("今日のユニーク", f"{today_unique}")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("予報表示回数", f"{forecast_views}")
+    c6.metric("予報表示ユニーク", f"{forecast_unique}")
+    if total_unique:
+        c7.metric("1人あたり平均アクセス", f"{total_access / total_unique:.1f}")
+    else:
+        c7.metric("1人あたり平均アクセス", "-")
+
+    if not page_df.empty:
+        daily = (
+            page_df.groupby("date_jst")
+            .agg(アクセス数=("session_id", "count"), ユニーク数=("visitor_hash", "nunique"))
+            .reset_index()
+        )
+        daily_long = daily.melt("date_jst", var_name="指標", value_name="件数")
+        st.subheader("日別アクセス数・ユニーク数")
+        chart = (
+            alt.Chart(daily_long)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("date_jst:N", title="日付"),
+                y=alt.Y("件数:Q", title="件数"),
+                color=alt.Color("指標:N", title="指標"),
+                tooltip=["date_jst:N", "指標:N", "件数:Q"],
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    st.subheader("端末別")
+    if "device_type" in page_df.columns and not page_df.empty:
+        device_summary = page_df["device_type"].fillna("unknown").value_counts().reset_index()
+        device_summary.columns = ["端末", "アクセス数"]
+        st.dataframe(device_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("直近ログ")
+    show_cols = [
+        "timestamp_jst", "event_name", "visitor_hash", "device_type",
+        "geo_success", "location_source", "lat_rounded", "lon_rounded", "forecast_days"
+    ]
+    existing_cols = [c for c in show_cols if c in df.columns]
+    st.dataframe(df[existing_cols].tail(100).iloc[::-1], use_container_width=True, hide_index=True)
+
+    csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "利用ログCSVをダウンロード",
+        data=csv_bytes,
+        file_name="usage_log.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 @st.cache_data(ttl=60 * 30)
@@ -378,6 +598,25 @@ def main() -> None:
         st.session_state.longitude = None
     if "location_source" not in st.session_state:
         st.session_state.location_source = "未設定"
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+    if "logged_page_view" not in st.session_state:
+        st.session_state.logged_page_view = False
+    if "logged_forecast_view" not in st.session_state:
+        st.session_state.logged_forecast_view = False
+
+    visitor_id = get_browser_visitor_id()
+    device_type, screen_width = get_browser_info()
+
+    if visitor_id and not st.session_state.logged_page_view:
+        log_usage_event(
+            event_name="page_view",
+            visitor_id=visitor_id,
+            session_id=st.session_state.session_id,
+            device_type=device_type,
+            screen_width=screen_width,
+        )
+        st.session_state.logged_page_view = True
 
     with st.sidebar:
         st.header("場所")
@@ -415,6 +654,20 @@ def main() -> None:
         st.caption("花粉はカテゴリー分けせず、花粉系合計として換気判断に反映します。")
         st.warning("スギ・ヒノキ専用値ではありません。")
 
+        st.divider()
+        st.header("管理者")
+        show_admin = st.checkbox("利用状況を表示")
+        admin_ok = False
+        if show_admin:
+            pin_input = st.text_input("管理PIN", type="password")
+            admin_ok = pin_input == _get_admin_pin()
+            if pin_input and not admin_ok:
+                st.error("管理PINが違います。")
+
+    if show_admin and admin_ok:
+        show_admin_analytics()
+        st.stop()
+
     latitude = st.session_state.latitude
     longitude = st.session_state.longitude
 
@@ -443,6 +696,21 @@ def main() -> None:
         forecast_df["日付"] = forecast_df["time"].apply(
             lambda x: f"{x.month}/{x.day}({jp_weekday(x)})"
         )
+
+        if visitor_id and not st.session_state.logged_forecast_view:
+            log_usage_event(
+                event_name="forecast_view",
+                visitor_id=visitor_id,
+                session_id=st.session_state.session_id,
+                device_type=device_type,
+                screen_width=screen_width,
+                geo_success=st.session_state.location_source == "現在地",
+                latitude=latitude,
+                longitude=longitude,
+                location_source=st.session_state.location_source,
+                forecast_days=forecast_days,
+            )
+            st.session_state.logged_forecast_view = True
 
         st.subheader("今後の換気予報")
         st.success(create_voice_text(forecast_df))
